@@ -96,13 +96,12 @@ def replicate_to_followers(key: str, value, version: int, is_delete: bool = Fals
             if ftr.result():
                 success += 1
                 log(f"Received ack {success}/{WRITE_QUORUM}")
+                if success >= WRITE_QUORUM:
+                    log(f"Quorum reached ({success} acks), stopping wait for remaining followers")
+                    return success
 
         except Exception:
             pass
-
-        if success >= WRITE_QUORUM:
-            log(f"Quorum reached ({success} acks), stopping wait for remaining followers")
-            return success
 
     log(f"Replication completed: {success} total acknowledgements")
     return success
@@ -222,7 +221,15 @@ def handle_put_key(key, body_bytes, wfile):
 
 
 def handle_health(wfile):
-    send_response(wfile, 200, {"status": "ok", "role": ROLE})
+    # Health check: verify store is accessible
+    try:
+        with STORE_LOCK:
+            # Try to access the store to ensure it's not corrupted
+            _ = len(STORE)
+        send_response(wfile, 200, {"status": "ok", "role": ROLE})
+    except Exception as e:
+        log(f"Health check FAILED: {e}")
+        send_response(wfile, 500, {"status": "unhealthy", "role": ROLE, "error": str(e)})
 
 
 def handle_delete_key(key, wfile):
@@ -318,7 +325,7 @@ def handle_replicate(body_bytes, wfile):
 # ==============================
 
 def handle_request(rfile, wfile, request_line, headers):
-    """Main request routing function"""
+    # Main request routing function
     try:
         parts = request_line.split()
         if len(parts) < 2:

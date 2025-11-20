@@ -41,7 +41,7 @@ def add_failure() -> None:
 
 
 def get_stats():
-    # Compute summary statistics from collected latencies.
+    # Compute summary statistics from collected latencies
     with metrics_lock:
         if not metrics_latencies:
             return None
@@ -55,24 +55,11 @@ def get_stats():
     min_v = min(latencies)
     max_v = max(latencies)
 
-    # Percentiles 
-    if len(latencies) >= 20:
-        p95 = statistics.quantiles(latencies, n=20)[18]
-    else:
-        p95 = max_v
-
-    if len(latencies) >= 100:
-        p99 = statistics.quantiles(latencies, n=100)[98]
-    else:
-        p99 = max_v
-
     return {
         "avg": avg,
         "median": median,
         "min": min_v,
         "max": max_v,
-        "p95": p95,
-        "p99": p99,
         "count": len(latencies),
         "failures": failures,
     }
@@ -89,7 +76,6 @@ def reset_metrics() -> None:
 def write_key_timed(key: str, value: str):
     
     # PUT a key to the leader and measure latency in ms.
-
     data = json.dumps({"value": value}).encode("utf-8")
     req = Request(
         f"{LEADER_URL}/kv/{key}",
@@ -155,10 +141,6 @@ def perform_concurrent_writes(num_writes: int, num_keys: int, num_threads: int):
 # --------------------------------------------------------------------
 
 def read_from_container(container: str, key: str):
-    """
-    Read a key from a specific container using docker exec + curl.
-    Returns parsed JSON or None.
-    """
     cmd = f"docker exec {container} curl -s http://localhost:8080/kv/{key}"
     try:
         result = subprocess.run(
@@ -293,7 +275,7 @@ def restart_with_quorum(quorum: int) -> bool:
         try:
             with urlopen(f"{LEADER_URL}/health", timeout=1) as resp:
                 if resp.status == 200:
-                    print("✓ System ready\n")
+                    print(" System ready\n")
                     return True
         except Exception:
             time.sleep(1)
@@ -353,7 +335,6 @@ def run_full_analysis():
     print(f"  Writes per key: ~{NUM_WRITES // NUM_KEYS}")
 
     results_by_quorum = {}
-
     # Test each quorum value
     for quorum in [1, 2, 3, 4, 5]:
         if not restart_with_quorum(quorum):
