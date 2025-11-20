@@ -81,8 +81,10 @@ def replicate_to_one(follower_url: str, key: str, value, version: int, is_delete
 
 def replicate_to_followers(key: str, value, version: int, is_delete: bool = False) -> int:
     if not FOLLOWER_URLS:
+        log("No followers configured")
         return 0
 
+    log(f"Starting replication to {len(FOLLOWER_URLS)} followers")
     futures = [
         REPL_EXECUTOR.submit(replicate_to_one, url, key, value, version, is_delete)
         for url in FOLLOWER_URLS
@@ -93,12 +95,16 @@ def replicate_to_followers(key: str, value, version: int, is_delete: bool = Fals
         try:
             if ftr.result():
                 success += 1
+                log(f"Received ack {success}/{WRITE_QUORUM}")
+
         except Exception:
             pass
 
         if success >= WRITE_QUORUM:
-            break
+            log(f"Quorum reached ({success} acks), stopping wait for remaining followers")
+            return success
 
+    log(f"Replication completed: {success} total acknowledgements")
     return success
 
 
@@ -150,12 +156,16 @@ def send_response(wfile, status_code, obj):
 
 def handle_get_key(key, wfile):
     # GET /kv/<key>
+    log(f"Handling GET request for key={key}")
+
     with STORE_LOCK:
         entry = STORE.get(key)
 
     if entry is None:
+        log(f"GET {key}: NOT FOUND")
         send_response(wfile, 404, {"error": "key not found"})
     else:
+        log(f"GET {key}: version={entry['version']}")
         send_response(wfile, 200, {
             "key": key,
             "value": entry["value"],
@@ -168,11 +178,13 @@ def handle_put_key(key, body_bytes, wfile):
     global CURRENT_VERSION
 
     if ROLE != "leader":
+        log(f"PUT {key}: REJECTED (not leader)")
         send_response(wfile, 403, {"error": "writes allowed only on leader"})
         return
 
     data = parse_json(body_bytes)
     if not data or "value" not in data:
+        log(f"PUT {key}: INVALID REQUEST")
         send_response(wfile, 400, {"error": "invalid json or missing 'value'"})
         return
 
@@ -184,12 +196,13 @@ def handle_put_key(key, body_bytes, wfile):
         version = CURRENT_VERSION
         STORE[key] = {"value": value, "version": version}
 
-    log(f"Received write for key={key}, version={version}, starting replication")
+    log(f"PUT {key}: version={version}, value={value}")
 
     # Replicate to followers
     success_followers = replicate_to_followers(key, value, version, is_delete=False)
 
     if success_followers >= WRITE_QUORUM:
+        log(f"PUT {key}: SUCCESS (acks={success_followers})")
         send_response(wfile, 200, {
             "status": "ok",
             "key": key,
@@ -199,6 +212,7 @@ def handle_put_key(key, body_bytes, wfile):
             "required_quorum": WRITE_QUORUM,
         })
     else:
+        log(f"PUT {key}: FAILED (acks={success_followers}/{WRITE_QUORUM})")
         send_response(wfile, 500, {
             "status": "failed",
             "reason": "not enough follower acknowledgements",
@@ -212,12 +226,14 @@ def handle_delete_key(key, wfile):
     global CURRENT_VERSION
 
     if ROLE != "leader":
+        log(f"DELETE {key}: REJECTED (not leader)")
         send_response(wfile, 403, {"error": "deletes allowed only on leader"})
         return
 
     # Check if key exists
     with STORE_LOCK:
         if key not in STORE:
+            log(f"DELETE {key}: NOT FOUND")
             send_response(wfile, 404, {"error": "key not found"})
             return
         
@@ -232,6 +248,7 @@ def handle_delete_key(key, wfile):
     success_followers = replicate_to_followers(key, None, version, is_delete=True)
 
     if success_followers >= WRITE_QUORUM:
+        log(f"DELETE {key}: SUCCESS (acks={success_followers})")
         send_response(wfile, 200, {
             "status": "ok",
             "key": key,
@@ -240,6 +257,7 @@ def handle_delete_key(key, wfile):
             "required_quorum": WRITE_QUORUM,
         })
     else:
+        log(f"DELETE {key}: FAILED (acks={success_followers}/{WRITE_QUORUM})")
         send_response(wfile, 500, {
             "status": "failed",
             "reason": "not enough follower acknowledgements",
@@ -272,6 +290,10 @@ def handle_replicate(body_bytes, wfile):
             if existing is None or version >= existing["version"]:
                 if key in STORE:
                     del STORE[key]
+                    log(f"Replicated DELETE: key={key}, version={version}")
+            else:
+                log(f"Skipped old version DELETE: key={key}, existing_version={existing['version']}, received_version={version}")
+
         else:
             # Write operation
             if "value" not in data:
@@ -280,6 +302,9 @@ def handle_replicate(body_bytes, wfile):
             
             if existing is None or version >= existing["version"]:
                 STORE[key] = {"value": value, "version": version}
+                log(f"Replicated WRITE: key={key}, value={value}, version={version}")
+            else:
+                log(f"Skipped old version: key={key}, existing_version={existing['version']}, received_version={version}")
 
     send_response(wfile, 200, {"status": "ok"})
 
@@ -374,7 +399,13 @@ def run_server():
     # Run the HTTP server
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind(("", PORT))
+    
+    try:
+        server_socket.bind(("", PORT))
+    except OSError as e:
+        log(f"Failed to bind to port {PORT}: {e}")
+        return
+    
     server_socket.listen(100)
     
     log(f"Starting server on port {PORT}")
