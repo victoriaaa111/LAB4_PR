@@ -1,0 +1,67 @@
+version: "3.8"
+
+services:
+  leader:
+    build: .
+    container_name: leader
+    environment:
+      ROLE: "leader"
+      PORT: "8080"
+      FOLLOWER_URLS: "http://f1:8080,http://f2:8080,http://f3:8080,http://f4:8080,http://f5:8080"
+      WRITE_QUORUM: "3"
+      # simulate network lag
+      MIN_DELAY_MS: "0.1"
+      MAX_DELAY_MS: "1.0"
+    ports:
+      - "8080:8080"  # expose leader to host
+    depends_on:
+      - f1
+      - f2
+      - f3
+      - f4
+      - f5
+
+  f1:
+    build: .
+    container_name: f1
+    environment:
+      ROLE: "follower"
+      PORT: "8080"
+    expose:
+      - "8080"
+
+  f2:
+    build: .
+    container_name: f2
+    environment:
+      ROLE: "follower"
+      PORT: "8080"
+    expose:
+      - "8080"
+
+  f3:
+    build: .
+    container_name: f3
+    environment:
+      ROLE: "follower"
+      PORT: "8080"
+    expose:
+      - "8080"
+
+  f4:
+    build: .
+    container_name: f4
+    environment:
+      ROLE: "follower"
+      PORT: "8080"
+    expose:
+      - "8080"
+
+  f5:
+    build: .
+    container_name: f5
+    environment:
+      ROLE: "follower"
+      PORT: "8080"
+    expose:
+      - "8080"
