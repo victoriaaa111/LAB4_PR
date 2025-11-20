@@ -3,10 +3,6 @@ FROM python:3.12-slim
 # Work directory inside the container
 WORKDIR /app
 
-# Install dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requests
-
 # Copy server code
 COPY app.py .
 
