@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   leader:
     build: .
@@ -8,7 +6,7 @@ services:
       ROLE: "leader"
       PORT: "8080"
       FOLLOWER_URLS: "http://f1:8080,http://f2:8080,http://f3:8080,http://f4:8080,http://f5:8080"
-      WRITE_QUORUM: "3"
+      WRITE_QUORUM: "5"
       # simulate network lag
       MIN_DELAY_MS: "0.1"
       MAX_DELAY_MS: "1.0"

@@ -3,6 +3,11 @@ FROM python:3.12-slim
 # Work directory inside the container
 WORKDIR /app
 
+#install curl
+RUN apt-get update && \
+    apt-get install -y curl && \
+    rm -rf /var/lib/apt/lists/*
+
 # Copy server code
 COPY app.py .
 

@@ -33,7 +33,7 @@ STORE_LOCK = threading.Lock()
 CURRENT_VERSION = 0
 
 # Thread pool for replication tasks
-REPL_EXECUTOR = ThreadPoolExecutor(max_workers=32)
+REPL_EXECUTOR = ThreadPoolExecutor(max_workers=20)
 
 
 # ==============================
@@ -221,6 +221,10 @@ def handle_put_key(key, body_bytes, wfile):
         })
 
 
+def handle_health(wfile):
+    send_response(wfile, 200, {"status": "ok", "role": ROLE})
+
+
 def handle_delete_key(key, wfile):
     # DELETE /kv/<key> - leader only
     global CURRENT_VERSION
@@ -344,7 +348,11 @@ def handle_request(rfile, wfile, request_line, headers):
         
         elif method == "POST" and parsed.path == "/replicate":
             handle_replicate(body_bytes, wfile)
-        
+
+        elif method == "GET" and path == "/health":
+            log("[HEALTH] Responding OK")
+            handle_health(wfile)
+
         else:
             send_response(wfile, 404, {"error": "not found"})
 
@@ -414,7 +422,7 @@ def run_server():
     else:
         log("Role: FOLLOWER")
     
-    executor = ThreadPoolExecutor(max_workers=50)
+    executor = ThreadPoolExecutor(max_workers=20)
     
     try:
         while True:
