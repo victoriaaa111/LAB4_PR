@@ -1,447 +1,228 @@
 import os
-import json
 import threading
 import time
 import random
-from urllib.parse import urlparse
-from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
+from typing import Dict, Any, Tuple, List
+
+from flask import Flask, request, jsonify
+import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import socket
-
 
 # ==============================
-#  Configuration from env vars
+# Configuration
 # ==============================
 
-ROLE = os.getenv("ROLE", "follower").lower()        
+ROLE = os.getenv("ROLE", "follower").lower()
 PORT = int(os.getenv("PORT", "8080"))
 
-WRITE_QUORUM = int(os.getenv("WRITE_QUORUM", "1"))
 FOLLOWER_URLS_ENV = os.getenv("FOLLOWER_URLS", "")
-FOLLOWER_URLS = [u for u in FOLLOWER_URLS_ENV.split(",") if u.strip()]
+FOLLOWER_URLS: List[str] = [u.strip() for u in FOLLOWER_URLS_ENV.split(",") if u.strip()]
 
-MIN_DELAY_MS = float(os.getenv("MIN_DELAY_MS", "0.1")) 
-MAX_DELAY_MS = float(os.getenv("MAX_DELAY_MS", "1.0"))
+MIN_DELAY_MS = float(os.getenv("MIN_DELAY_MS", "0.0"))
+MAX_DELAY_MS = float(os.getenv("MAX_DELAY_MS", "1000.0"))
+
+DEFAULT_WRITE_QUORUM = int(os.getenv("WRITE_QUORUM", "1"))
+write_quorum_lock = threading.Lock()
+write_quorum = DEFAULT_WRITE_QUORUM
 
 # ==============================
-#  In memory key-value store
+# Data store and concurrency
 # ==============================
 
-STORE = {}
+# STORE: key -> {"value": str, "version": int}
+STORE: Dict[str, Dict[str, Any]] = {}
 STORE_LOCK = threading.Lock()
-CURRENT_VERSION = 0
 
-# Thread pool for replication tasks
-REPL_EXECUTOR = ThreadPoolExecutor(max_workers=20)
+# Thread pool for replication tasks on the leader
+REPLICATION_EXECUTOR = ThreadPoolExecutor(max_workers=50)
+
+app = Flask(__name__)
 
 
 # ==============================
-#  Helper functions
+# Utility functions
 # ==============================
 
-def log(msg: str):
-    print(f"[{ROLE.upper()}] {msg}", flush=True)
+def get_write_quorum() -> int:
+    with write_quorum_lock:
+        return write_quorum
 
 
-def replicate_to_one(follower_url: str, key: str, value, version: int, is_delete: bool = False) -> bool:
-    delay_sec = random.uniform(MIN_DELAY_MS, MAX_DELAY_MS) / 1000.0
-    time.sleep(delay_sec)
+def set_write_quorum(new_q: int) -> None:
+    global write_quorum
+    with write_quorum_lock:
+        write_quorum = new_q
 
+
+def set_local_value(key: str, value: str) -> int:
+
+    with STORE_LOCK:
+        record = STORE.get(key)
+        if record is None:
+            version = 1
+        else:
+            version = int(record["version"]) + 1
+        STORE[key] = {"value": value, "version": version}
+        return version
+
+
+def set_local_value_with_version(key: str, value: str, version: int) -> None:
+
+    with STORE_LOCK:
+        record = STORE.get(key)
+        if record is None or version >= int(record["version"]):
+            STORE[key] = {"value": value, "version": int(version)}
+
+
+def get_local_value(key: str) -> Dict[str, Any]:
+    with STORE_LOCK:
+        record = STORE.get(key)
+        if record is None:
+            raise KeyError(key)
+        return {"key": key, "value": record["value"], "version": int(record["version"])}
+
+
+def replicate_to_single_follower(url: str, key: str, value: str, version: int) -> bool:
     try:
-        data = json.dumps({
-            "key": key, 
-            "value": value, 
-            "version": version,
-            "is_delete": is_delete
-        }).encode('utf-8')
-        
-        req = Request(
-            f"{follower_url}/replicate",
-            data=data,
-            headers={'Content-Type': 'application/json'}
+        delay_ms = random.uniform(MIN_DELAY_MS, MAX_DELAY_MS)
+        time.sleep(delay_ms / 1000.0)
+
+        resp = requests.post(
+            f"{url}/replicate",
+            json={"key": key, "value": value, "version": version},
+            timeout=5.0,
         )
-        
-        with urlopen(req, timeout=1.0) as response:
-            ok = (response.status == 200)
-            if not ok:
-                log(f"Replication to {follower_url} FAILED with status {response.status}")
-            return ok
-            
-    except HTTPError as e:
-        log(f"Replication to {follower_url} FAILED with status {e.code}")
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("status") == "ok"
         return False
-    except URLError as e:
-        log(f"Replication to {follower_url} EXCEPTION: {e.reason}")
-        return False
-    except Exception as e:
-        log(f"Replication to {follower_url} EXCEPTION: {e}")
+    except Exception:
         return False
 
 
-def replicate_to_followers(key: str, value, version: int, is_delete: bool = False) -> int:
+def replicate_to_followers(key: str, value: str, version: int) -> Tuple[bool, int]:
     if not FOLLOWER_URLS:
-        log("No followers configured")
-        return 0
+        return True, 0
 
-    log(f"Starting replication to {len(FOLLOWER_URLS)} followers")
-    futures = [
-        REPL_EXECUTOR.submit(replicate_to_one, url, key, value, version, is_delete)
-        for url in FOLLOWER_URLS
-    ]
+    futures = []
+    for url in FOLLOWER_URLS:
+        ftr = REPLICATION_EXECUTOR.submit(
+            replicate_to_single_follower, url, key, value, version
+        )
+        futures.append(ftr)
 
-    success = 0
+    required = get_write_quorum()
+    ack_count = 0
+    success = False
+
+    # Wait only until quorum is reached or all responses have arrived
     for ftr in as_completed(futures):
         try:
-            if ftr.result():
-                success += 1
-                log(f"Received ack {success}/{WRITE_QUORUM}")
-                if success >= WRITE_QUORUM:
-                    log(f"Quorum reached ({success} acks), stopping wait for remaining followers")
-                    return success
-
+            ok = ftr.result()
         except Exception:
-            pass
+            ok = False
 
-    log(f"Replication completed: {success} total acknowledgements")
-    return success
+        if ok:
+            ack_count += 1
+            if ack_count >= required:
+                success = True
+                break
 
-
-def read_body(rfile, headers):
-    length_str = headers.get("Content-Length", "0")
-    try:
-        length = int(length_str)
-    except ValueError:
-        length = 0
-    
-    return rfile.read(length) if length > 0 else b""
-
-
-def parse_json(body_bytes):
-    if not body_bytes:
-        return None
-    try:
-        return json.loads(body_bytes.decode("utf-8"))
-    except json.JSONDecodeError:
-        return None
-
-
-def send_response(wfile, status_code, obj):
-    body = json.dumps(obj).encode("utf-8")
-    
-    status_messages = {
-        200: "OK",
-        400: "Bad Request",
-        403: "Forbidden",
-        404: "Not Found",
-        500: "Internal Server Error"
-    }
-    
-    response_line = f"HTTP/1.1 {status_code} {status_messages.get(status_code, 'OK')}\r\n".encode()
-    headers = (
-        f"Content-Type: application/json\r\n"
-        f"Content-Length: {len(body)}\r\n"
-        f"\r\n"
-    ).encode()
-    
-    wfile.write(response_line)
-    wfile.write(headers)
-    wfile.write(body)
+    return success, ack_count
 
 
 # ==============================
-#  Route Handlers
+# HTTP API
 # ==============================
 
-def handle_get_key(key, wfile):
-    # GET /kv/<key>
-    log(f"Handling GET request for key={key}")
-
+@app.route("/health", methods=["GET"])
+def health() -> Any:
     with STORE_LOCK:
-        entry = STORE.get(key)
-
-    if entry is None:
-        log(f"GET {key}: NOT FOUND")
-        send_response(wfile, 404, {"error": "key not found"})
-    else:
-        log(f"GET {key}: version={entry['version']}")
-        send_response(wfile, 200, {
-            "key": key,
-            "value": entry["value"],
-            "version": entry["version"],
-        })
+        keys = list(STORE.keys())
+    return jsonify({
+        "status": "ok",
+        "role": ROLE,
+        "keys": keys,
+        "write_quorum": get_write_quorum(),
+    })
 
 
-def handle_put_key(key, body_bytes, wfile):
-    # PUT /kv/<key> - leader only
-    global CURRENT_VERSION
+@app.route("/set", methods=["POST"])
+def handle_set() -> Any:
 
     if ROLE != "leader":
-        log(f"PUT {key}: REJECTED (not leader)")
-        send_response(wfile, 403, {"error": "writes allowed only on leader"})
-        return
+        return jsonify({"error": "Writes are only accepted on the leader"}), 400
 
-    data = parse_json(body_bytes)
-    if not data or "value" not in data:
-        log(f"PUT {key}: INVALID REQUEST")
-        send_response(wfile, 400, {"error": "invalid json or missing 'value'"})
-        return
+    data = request.get_json(force=True, silent=False)
+    key = data.get("key")
+    value = data.get("value")
 
-    value = data["value"]
+    if key is None or value is None:
+        return jsonify({"error": "key and value are required"}), 400
 
-    # Update leader's store
-    with STORE_LOCK:
-        CURRENT_VERSION += 1
-        version = CURRENT_VERSION
-        STORE[key] = {"value": value, "version": version}
+    version = set_local_value(key, value)
+    success, ack_count = replicate_to_followers(key, value, version)
 
-    log(f"PUT {key}: version={version}, value={value}")
+    status = "committed" if success else "failed"
 
-    # Replicate to followers
-    success_followers = replicate_to_followers(key, value, version, is_delete=False)
-
-    if success_followers >= WRITE_QUORUM:
-        log(f"PUT {key}: SUCCESS (acks={success_followers})")
-        send_response(wfile, 200, {
-            "status": "ok",
-            "key": key,
-            "value": value,
-            "version": version,
-            "acks": success_followers,
-            "required_quorum": WRITE_QUORUM,
-        })
-    else:
-        log(f"PUT {key}: FAILED (acks={success_followers}/{WRITE_QUORUM})")
-        send_response(wfile, 500, {
-            "status": "failed",
-            "reason": "not enough follower acknowledgements",
-            "acks": success_followers,
-            "required_quorum": WRITE_QUORUM,
-        })
+    return jsonify({
+        "status": status,
+        "key": key,
+        "value": value,
+        "version": version,
+        "acks": ack_count,
+        "required_quorum": get_write_quorum(),
+    }), (200 if success else 500)
 
 
-def handle_health(wfile):
-    # Health check: verify store is accessible
-    try:
-        with STORE_LOCK:
-            # Try to access the store to ensure it's not corrupted
-            _ = len(STORE)
-        send_response(wfile, 200, {"status": "ok", "role": ROLE})
-    except Exception as e:
-        log(f"Health check FAILED: {e}")
-        send_response(wfile, 500, {"status": "unhealthy", "role": ROLE, "error": str(e)})
+@app.route("/replicate", methods=["POST"])
+def handle_replicate() -> Any:
 
-
-def handle_delete_key(key, wfile):
-    # DELETE /kv/<key> - leader only
-    global CURRENT_VERSION
-
-    if ROLE != "leader":
-        log(f"DELETE {key}: REJECTED (not leader)")
-        send_response(wfile, 403, {"error": "deletes allowed only on leader"})
-        return
-
-    # Check if key exists
-    with STORE_LOCK:
-        if key not in STORE:
-            log(f"DELETE {key}: NOT FOUND")
-            send_response(wfile, 404, {"error": "key not found"})
-            return
-        
-        CURRENT_VERSION += 1
-        version = CURRENT_VERSION
-        # Remove from leader's store
-        del STORE[key]
-
-    log(f"Received delete for key={key}, version={version}, starting replication")
-
-    # Replicate delete to followers
-    success_followers = replicate_to_followers(key, None, version, is_delete=True)
-
-    if success_followers >= WRITE_QUORUM:
-        log(f"DELETE {key}: SUCCESS (acks={success_followers})")
-        send_response(wfile, 200, {
-            "status": "ok",
-            "key": key,
-            "version": version,
-            "acks": success_followers,
-            "required_quorum": WRITE_QUORUM,
-        })
-    else:
-        log(f"DELETE {key}: FAILED (acks={success_followers}/{WRITE_QUORUM})")
-        send_response(wfile, 500, {
-            "status": "failed",
-            "reason": "not enough follower acknowledgements",
-            "acks": success_followers,
-            "required_quorum": WRITE_QUORUM,
-        })
-
-
-def handle_replicate(body_bytes, wfile):
-    # POST /replicate - followers receive this
-    data = parse_json(body_bytes)
-    if not data:
-        send_response(wfile, 400, {"error": "invalid json"})
-        return
-
+    data = request.get_json(force=True, silent=False)
     key = data.get("key")
     value = data.get("value")
     version = data.get("version")
-    is_delete = data.get("is_delete", False)
 
-    if key is None or version is None:
-        send_response(wfile, 400, {"error": "missing key/version"})
-        return
+    if key is None or value is None or version is None:
+        return jsonify({"error": "key, value and version are required"}), 400
 
-    with STORE_LOCK:
-        existing = STORE.get(key)
-        
-        if is_delete:
-            # Delete operation
-            if existing is None or version >= existing["version"]:
-                if key in STORE:
-                    del STORE[key]
-                    log(f"Replicated DELETE: key={key}, version={version}")
-            else:
-                log(f"Skipped old version DELETE: key={key}, existing_version={existing['version']}, received_version={version}")
+    set_local_value_with_version(key, value, int(version))
+    return jsonify({"status": "ok"})
 
-        else:
-            # Write operation
-            if "value" not in data:
-                send_response(wfile, 400, {"error": "missing value"})
-                return
-            
-            if existing is None or version >= existing["version"]:
-                STORE[key] = {"value": value, "version": version}
-                log(f"Replicated WRITE: key={key}, value={value}, version={version}")
-            else:
-                log(f"Skipped old version: key={key}, existing_version={existing['version']}, received_version={version}")
 
-    send_response(wfile, 200, {"status": "ok"})
+@app.route("/get/<key>", methods=["GET"])
+def handle_get(key: str) -> Any:
+
+    try:
+        record = get_local_value(key)
+        return jsonify(record)
+    except KeyError:
+        return jsonify({"error": "key not found"}), 404
+
+
+@app.route("/config/write_quorum", methods=["POST"])
+def handle_set_write_quorum() -> Any:
+
+    if ROLE != "leader":
+        return jsonify({"error": "write quorum can only be configured on the leader"}), 400
+
+    data = request.get_json(force=True, silent=False)
+    q = data.get("write_quorum")
+    if q is None:
+        return jsonify({"error": "write_quorum is required"}), 400
+
+    q = int(q)
+    if q < 1:
+        return jsonify({"error": "write_quorum must be >= 1"}), 400
+
+    set_write_quorum(q)
+    return jsonify({"status": "ok", "write_quorum": get_write_quorum()})
 
 
 # ==============================
-#  Request Handler Function
+# Main
 # ==============================
-
-def handle_request(rfile, wfile, request_line, headers):
-    # Main request routing function
-    try:
-        parts = request_line.split()
-        if len(parts) < 2:
-            send_response(wfile, 400, {"error": "bad request"})
-            return
-
-        method = parts[0]
-        path = parts[1]
-        
-        parsed = urlparse(path)
-        path_parts = parsed.path.strip("/").split("/")
-
-        # Read body for POST/PUT
-        body_bytes = b""
-        if method in ["POST", "PUT"]:
-            body_bytes = read_body(rfile, headers)
-
-        # Route handling
-        if method == "GET" and len(path_parts) == 2 and path_parts[0] == "kv":
-            handle_get_key(path_parts[1], wfile)
-        
-        elif method == "PUT" and len(path_parts) == 2 and path_parts[0] == "kv":
-            handle_put_key(path_parts[1], body_bytes, wfile)
-        
-        elif method == "DELETE" and len(path_parts) == 2 and path_parts[0] == "kv":
-            handle_delete_key(path_parts[1], wfile)
-        
-        elif method == "POST" and parsed.path == "/replicate":
-            handle_replicate(body_bytes, wfile)
-
-        elif method == "GET" and path == "/health":
-            log("[HEALTH] Responding OK")
-            handle_health(wfile)
-
-        else:
-            send_response(wfile, 404, {"error": "not found"})
-
-    except Exception as e:
-        log(f"Error handling request: {e}")
-        try:
-            send_response(wfile, 500, {"error": "internal server error"})
-        except:
-            pass
-
-
-# ==============================
-#  Simple Server with Threading
-# ==============================
-
-def handle_client(conn, addr):
-    # Handle a single client connection
-    try:
-        rfile = conn.makefile('rb')
-        wfile = conn.makefile('wb')
-        
-        # Read request line
-        request_line = rfile.readline().decode('utf-8').strip()
-        if not request_line:
-            return
-        
-        # Read headers
-        headers = {}
-        while True:
-            line = rfile.readline().decode('utf-8').strip()
-            if not line:
-                break
-            if ':' in line:
-                key, value = line.split(':', 1)
-                headers[key.strip()] = value.strip()
-        
-        # Handle the request
-        handle_request(rfile, wfile, request_line, headers)
-        
-        wfile.flush()
-        
-    except Exception as e:
-        log(f"Error with client {addr}: {e}")
-    finally:
-        try:
-            conn.close()
-        except:
-            pass
-
-
-def run_server():
-    # Run the HTTP server
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    
-    try:
-        server_socket.bind(("", PORT))
-    except OSError as e:
-        log(f"Failed to bind to port {PORT}: {e}")
-        return
-    
-    server_socket.listen(100)
-    
-    log(f"Starting server on port {PORT}")
-    if ROLE == "leader":
-        log(f"Role: LEADER, write_quorum={WRITE_QUORUM}, followers={FOLLOWER_URLS}")
-    else:
-        log("Role: FOLLOWER")
-    
-    executor = ThreadPoolExecutor(max_workers=20)
-    
-    try:
-        while True:
-            conn, addr = server_socket.accept()
-            executor.submit(handle_client, conn, addr)
-    except KeyboardInterrupt:
-        log("Shutting down server")
-    finally:
-        server_socket.close()
-        executor.shutdown(wait=False)
-        REPL_EXECUTOR.shutdown(wait=False)
-
 
 if __name__ == "__main__":
-    run_server()
+    # threaded=True -> concurrent request handling on both leader and followers
+    app.run(host="0.0.0.0", port=PORT, threaded=True)

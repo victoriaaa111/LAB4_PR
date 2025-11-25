@@ -1,65 +1,69 @@
+version: "3.9"
+
 services:
   leader:
     build: .
     container_name: leader
     environment:
-      ROLE: "leader"
-      PORT: "8080"
-      FOLLOWER_URLS: "http://f1:8080,http://f2:8080,http://f3:8080,http://f4:8080,http://f5:8080"
-      WRITE_QUORUM: "3"
-      # simulate network lag
-      MIN_DELAY_MS: "0.1"
-      MAX_DELAY_MS: "1.0"
+      - ROLE=leader
+      - PORT=8080
+      # default, overridden by /config/write_quorum in performance_analysis
+      - WRITE_QUORUM=3
+      # inside the Docker network, leader reaches followers by service name
+      - FOLLOWER_URLS=http://follower1:8080,http://follower2:8080,http://follower3:8080,http://follower4:8080,http://follower5:8080
+      # delay in milliseconds (simulated network lag)
+      - MIN_DELAY_MS=0.0
+      - MAX_DELAY_MS=1000.0
     ports:
-      - "8080:8080"  # expose leader to host
+      - "8000:8080"  # expose leader to the host
     depends_on:
-      - f1
-      - f2
-      - f3
-      - f4
-      - f5
+      - follower1
+      - follower2
+      - follower3
+      - follower4
+      - follower5
 
-  f1:
+  follower1:
     build: .
-    container_name: f1
+    container_name: follower1
     environment:
-      ROLE: "follower"
-      PORT: "8080"
-    expose:
-      - "8080"
+      - ROLE=follower
+      - PORT=8080
+    ports:
+      - "8001:8080"
 
-  f2:
+  follower2:
     build: .
-    container_name: f2
+    container_name: follower2
     environment:
-      ROLE: "follower"
-      PORT: "8080"
-    expose:
-      - "8080"
+      - ROLE=follower
+      - PORT=8080
+    ports:
+      - "8002:8080"
 
-  f3:
+  follower3:
     build: .
-    container_name: f3
+    container_name: follower3
     environment:
-      ROLE: "follower"
-      PORT: "8080"
-    expose:
-      - "8080"
+      - ROLE=follower
+      - PORT=8080
+    ports:
+      - "8003:8080"
 
-  f4:
+  follower4:
     build: .
-    container_name: f4
+    container_name: follower4
     environment:
-      ROLE: "follower"
-      PORT: "8080"
-    expose:
-      - "8080"
+      - ROLE=follower
+      - PORT=8080
+    ports:
+      - "8004:8080"
 
-  f5:
+  follower5:
     build: .
-    container_name: f5
+    container_name: follower5
     environment:
-      ROLE: "follower"
-      PORT: "8080"
-    expose:
-      - "8080"
+      - ROLE=follower
+      - PORT=8080
+    ports:
+      - "8005:8080"
