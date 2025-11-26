@@ -18,4 +18,4 @@ ENV ROLE=follower \
     MAX_DELAY_MS=1000.0
 
 # Run the key-value store server
-CMD ["python", "app.py"]
+CMD ["python", "-u", "app.py"]

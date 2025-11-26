@@ -12,6 +12,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Configuration
 # ==============================
 
+GLOBAL_VERSION = 0
+GLOBAL_VERSION_LOCK = threading.Lock()
+
 ROLE = os.getenv("ROLE", "follower").lower()
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -55,23 +58,30 @@ def set_write_quorum(new_q: int) -> None:
 
 
 def set_local_value(key: str, value: str) -> int:
+    global GLOBAL_VERSION
+
+    with GLOBAL_VERSION_LOCK:
+        GLOBAL_VERSION += 1
+        version = GLOBAL_VERSION
 
     with STORE_LOCK:
-        record = STORE.get(key)
-        if record is None:
-            version = 1
-        else:
-            version = int(record["version"]) + 1
         STORE[key] = {"value": value, "version": version}
-        return version
+
+    print(f"[LEADER] COMMIT key={key} v={version} value={value}")
+    return version
 
 
 def set_local_value_with_version(key: str, value: str, version: int) -> None:
 
     with STORE_LOCK:
         record = STORE.get(key)
-        if record is None or version >= int(record["version"]):
-            STORE[key] = {"value": value, "version": int(version)}
+        old_ver = int(record["version"]) if record else 0
+        if version >= old_ver:
+            STORE[key] = {"value": value, "version": version}
+            print(f"[{ROLE.upper()}] APPLY key={key} old_v={old_ver} -> new_v={version} value={value}")
+
+        else:
+            print(f"[{ROLE.upper()}] IGNORE key={key} old_v={old_ver} incoming_v={version} value={value}")
 
 
 def get_local_value(key: str) -> Dict[str, Any]:
@@ -87,6 +97,8 @@ def replicate_to_single_follower(url: str, key: str, value: str, version: int) -
         delay_ms = random.uniform(MIN_DELAY_MS, MAX_DELAY_MS)
         time.sleep(delay_ms / 1000.0)
 
+        print(f"[LEADER] send key={key} v={version} to {url} delay={delay_ms:.1f}ms")
+
         resp = requests.post(
             f"{url}/replicate",
             json={"key": key, "value": value, "version": version},
@@ -94,9 +106,13 @@ def replicate_to_single_follower(url: str, key: str, value: str, version: int) -
         )
         if resp.status_code == 200:
             data = resp.json()
+            if data.get("status") == "ok":
+                print(f"[LEADER] follower={url} ack={ok} key={key} v={version}")
             return data.get("status") == "ok"
         return False
     except Exception:
+        print(f"[LEADER] follower={url} ack={ok} key={key} v={version}")
+
         return False
 
 

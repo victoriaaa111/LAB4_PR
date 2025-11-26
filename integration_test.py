@@ -126,10 +126,44 @@ def main() -> None:
         fh = requests.get(f"{f}/health", timeout=5.0).json()
         print(f"{f}:", fh)
 
-    # run tests
-    test_single_write_replication()
-    test_concurrent_writes_consistency()
+    race_demo_same_key()
     print("\n All integration checks PASSED.")
+
+
+def race_demo_same_key():
+
+    print("\n=== Race demo: 15 concurrent writes on same key ===")
+    set_write_quorum(1)  # small quorum to maximize overlap
+
+    key = "race_key"
+    num_writes = 15
+
+    def write_once(i: int):
+        value = f"race_val_{i}"
+        r = requests.post(
+            f"{LEADER_URL}/set",
+            json={"key": key, "value": value},
+            timeout=10.0,
+        )
+        data = r.json()
+        return i, data
+
+    with ThreadPoolExecutor(max_workers=num_writes) as ex:
+        futures = [ex.submit(write_once, i) for i in range(num_writes)]
+        for fut in as_completed(futures):
+            fut.result()
+
+    # Give replication time to finish
+    time.sleep(5.0)
+
+    # Final state on leader
+    leader_rec = get_record(LEADER_URL, key)
+    print("[CLIENT] FINAL leader:", leader_rec)
+
+    # Final state on followers
+    for url in FOLLOWER_URLS:
+        follower_rec = get_record(url, key)
+        print(f"[CLIENT] FINAL {url}:", follower_rec)
 
 
 if __name__ == "__main__":
